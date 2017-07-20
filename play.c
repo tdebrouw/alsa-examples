@@ -3,6 +3,10 @@
  */
 
 #include "alsa/asoundlib.h"
+#include <math.h>
+
+/* debugging */
+static snd_output_t *output = NULL;
 
 /* playback device */
 static char *device = "hw:1,0";
@@ -11,7 +15,7 @@ static char *device = "hw:1,0";
 /* can alsa resample? */
 int hw_resample = 1;
 /* memory format */
-snd_pcm_access_t hw_access = SND_PCM_ACCESS_MMAP_INTERLEAVED;
+snd_pcm_access_t hw_access = SND_PCM_ACCESS_RW_INTERLEAVED;
 /* sample format */
 snd_pcm_format_t hw_format = SND_PCM_FORMAT_S16_LE;
 /* number of channels */
@@ -26,6 +30,16 @@ snd_pcm_uframes_t hw_buffer_size;
 unsigned int hw_period_time = 100000;
 /* size of hw_period in frames - filled by application */
 snd_pcm_uframes_t hw_period_size;
+
+
+/* audio samples */
+short int*  buffer = NULL;
+unsigned int buffer_size;
+
+/* requested frequency */
+static double freq = 440;
+
+
 
 /* set hw parameters */
 static int set_hwparams(snd_pcm_t *handle,
@@ -141,7 +155,7 @@ static int set_swparams(snd_pcm_t *handle, snd_pcm_sw_params_t *params)
 	}
 
 	/* allow the transfer when at least period_size samples can be processed */
-	err = snd_pcm_sw_params_set_avail_min(handle, params, hw_buffer_size);
+	err = snd_pcm_sw_params_set_avail_min(handle, params, hw_period_size);
 	if (err < 0) {
 		printf("Unable to set avail min for playback: %s\n", snd_strerror(err));
 		return err;
@@ -157,12 +171,94 @@ static int set_swparams(snd_pcm_t *handle, snd_pcm_sw_params_t *params)
 	return 0;
 }
 
+static void generate_sine(short int *buffer,
+                          int count, double *_phase)
+{
+	static double max_phase = 2. * M_PI;
+	double phase = *_phase;
+	double step = max_phase * freq / (double) hw_rate;
+
+	int format_bits = snd_pcm_format_width(hw_format);
+	unsigned int maxval = (1 << (format_bits - 1)) - 1;
+
+	unsigned int i = 0, j = 0;
+
+	/* total area to fill = period * hw_channels */
+	count *= hw_channels;
+	while (i < count) {
+
+		/* sample value */
+		int res = sin(phase) * maxval;
+
+		/* all channels contain the same data */
+		for (j = 0; j < hw_channels; j++)
+			buffer[i++] = (signed short) res; /* left */
+
+		/* move phase & reset if necessary */
+		phase += step;
+		if (phase >= max_phase)
+			phase -= max_phase;
+	}
+
+	/* store phase for later */
+	*_phase = phase;
+}
+
+static int write_loop(snd_pcm_t *handle,
+                      short int *buffer)
+{
+	double phase = 0;
+	int err;
+	short int *ptr;
+	int ptr_size;
+
+	while (1) {
+
+		/* generate sine */
+		generate_sine(buffer, hw_period_size, &phase);
+
+		/* pointer to buffer */
+		ptr = buffer;
+
+		/* copy of size */
+		ptr_size = hw_period_size;
+
+		/* as long as we have data */
+		while (ptr_size > 0) {
+
+			/* write to module */
+			err = snd_pcm_writei(handle, ptr, ptr_size);
+
+			/* EAGAIN failure? -> retry */
+			if (err == -EAGAIN)
+				continue;
+
+			/* everything else -> stop */
+			if (err < 0) {
+				printf("Write error: %s\n", snd_strerror(err));
+				exit(EXIT_FAILURE);
+			}
+
+			/* move buffer pointer */
+			ptr += err * hw_channels;
+			ptr_size -= err;
+		}
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	int err = 0;
 	snd_pcm_t *handle = NULL;
 	snd_pcm_hw_params_t *hw_params = NULL;
 	snd_pcm_sw_params_t *sw_params = NULL;
+
+	/* attach snd output to stdio - debug purposes */
+	err = snd_output_stdio_attach(&output, stdout, 0);
+	if (err < 0) {
+		printf("Output failed: %s\n", snd_strerror(err));
+		return 0;
+	}
 
 	/* allocate memory for hw/sw parameters */
 	snd_pcm_hw_params_alloca(&hw_params);
@@ -188,12 +284,35 @@ int main(int argc, char *argv[])
 	printf("hw_period_time: %u\n", hw_period_time);
 	printf("hw_period_size: %u\n", hw_period_size);
 
+	printf("phys width: %u\n",  snd_pcm_format_physical_width(hw_format));
+
 	/* set sw parameters */
 	err = set_swparams(handle, sw_params);
 	if (err < 0) {
 		printf("Setting of swparams failed: %s\n", snd_strerror(err));
 		exit(EXIT_FAILURE);
 	}
+
+	/* print configuration */
+	snd_pcm_dump(handle, output);
+
+	/* buffersize: allocate enough for 2 times a period */
+	buffer_size = (hw_period_size * hw_channels *
+	               snd_pcm_format_physical_width(hw_format)) / 8;
+
+	/* allocate memory for audio samples */
+	buffer = malloc(buffer_size);
+	if (buffer == NULL) {
+		printf("No enough memory\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* write audio */
+	write_loop(handle, buffer);
+	if (err < 0)
+		printf("Transfer failed: %s\n", snd_strerror(err));
+
+	free(buffer);
 
 	/* close devicehandle */
 	snd_pcm_close(handle);
