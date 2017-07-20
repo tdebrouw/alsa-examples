@@ -121,14 +121,52 @@ static int set_hwparams(snd_pcm_t *handle,
 	return 0;
 }
 
+static int set_swparams(snd_pcm_t *handle, snd_pcm_sw_params_t *params)
+{
+	int err;
+	snd_pcm_uframes_t threshold = (hw_buffer_size / hw_period_size) * hw_period_size;
+
+	/* request the current swparams */
+	err = snd_pcm_sw_params_current(handle, params);
+	if (err < 0) {
+		printf("Unable to get current swparams: %s\n", snd_strerror(err));
+		return err;
+	}
+
+	/* set transfer threshold - when to start? */
+	err = snd_pcm_sw_params_set_start_threshold(handle, params, threshold);
+	if (err < 0) {
+		printf("Setting start threshold failed: %s\n", snd_strerror(err));
+		return err;
+	}
+
+	/* allow the transfer when at least period_size samples can be processed */
+	err = snd_pcm_sw_params_set_avail_min(handle, params, hw_buffer_size);
+	if (err < 0) {
+		printf("Unable to set avail min for playback: %s\n", snd_strerror(err));
+		return err;
+	}
+
+	/* write the parameters to the playback device */
+	err = snd_pcm_sw_params(handle, params);
+	if (err < 0) {
+		printf("Unable to set sw params for playback: %s\n", snd_strerror(err));
+		return err;
+	}
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	int err = 0;
 	snd_pcm_t *handle = NULL;
 	snd_pcm_hw_params_t *hw_params = NULL;
+	snd_pcm_sw_params_t *sw_params = NULL;
 
-	/* allocate memory for hw parameters */
+	/* allocate memory for hw/sw parameters */
 	snd_pcm_hw_params_alloca(&hw_params);
+	snd_pcm_sw_params_alloca(&sw_params);
 
 	/* open devicehandle */
 	err = snd_pcm_open(&handle, device, SND_PCM_STREAM_PLAYBACK, 0);
@@ -149,6 +187,13 @@ int main(int argc, char *argv[])
 
 	printf("hw_period_time: %u\n", hw_period_time);
 	printf("hw_period_size: %u\n", hw_period_size);
+
+	/* set sw parameters */
+	err = set_swparams(handle, sw_params);
+	if (err < 0) {
+		printf("Setting of swparams failed: %s\n", snd_strerror(err));
+		exit(EXIT_FAILURE);
+	}
 
 	/* close devicehandle */
 	snd_pcm_close(handle);
